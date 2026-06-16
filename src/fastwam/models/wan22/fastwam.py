@@ -274,6 +274,177 @@ class FastWAM(torch.nn.Module):
             frames.append(Image.fromarray(frame))
         return frames
 
+    @torch.no_grad()
+    def extract_world_features(
+        self,
+        input_image: torch.Tensor,
+        prompt: Optional[str] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        tap_layer: int = 15,
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        """Extract frame-0 video-DiT hidden states (the distillation REPA target).
+
+        Mirrors the *video prefill* path of :meth:`infer_action` (single-frame, t=0)
+        but runs only the video expert up to ``tap_layer`` and returns the per-token
+        hidden states reshaped onto the latent grid.
+
+        Frame-0 hidden states are invariant to the (absent) future tokens here: with
+        ``first_frame_causal`` masking frame-0 never attends future tokens, and the
+        ``seperated_timestep`` path pins frame-0 to ``t=0`` — so these single-frame
+        features are identical to the frame-0 features seen during multi-frame
+        training. See the model's training/inference invariance for details.
+
+        Either ``prompt`` (encoded internally) or both ``context``/``context_mask``
+        must be provided (same contract as :meth:`infer_action`).
+
+        Args:
+            input_image: Frame-0 image, shape [3, H, W] or [1, 3, H, W], pixels in
+                [-1, 1] (the 2-cam horizontal concat used by the dataset).
+            prompt: Optional instruction text; mutually exclusive with ``context``.
+            context: Optional precomputed text embedding [B, L, D] or [L, D].
+            context_mask: Optional text mask [B, L] or [L].
+            proprio: Optional proprio [D] or [1, D] (requires ``proprio_dim`` set).
+            tap_layer: Inclusive video-expert block index to tap (default 15).
+            tiled: Pass-through to the VAE encoder.
+
+        Returns:
+            dict with:
+              - ``hidden``: [B, h, w, hidden_dim] frame-0 hidden at ``tap_layer``.
+              - ``grid_size``: (f, h, w) latent-patch grid (f == 1).
+              - ``tokens_per_frame``: int.
+        """
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`extract_world_features` requires `video_attention_mask_mode='first_frame_causal'` "
+                "(matches `infer_action`)."
+            )
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+        if not fuse_flag:
+            raise ValueError(
+                "`extract_world_features` requires `fuse_vae_embedding_in_latents=True` "
+                "(the seperated_timestep path)."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_image` HxW must be multiples of 16, got ({height},{width})."
+            )
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+
+        # --- text (+ optional proprio) context: same contract as infer_action ---
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            context = context.to(device=self.device, dtype=self.torch_dtype)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` provided but `proprio_dim=None` (proprio_encoder disabled).")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            if proprio.ndim != 2 or proprio.shape[1] != self.proprio_dim:
+                raise ValueError(
+                    f"`proprio` must be [D] or [1,D] with D={self.proprio_dim}, got {tuple(proprio.shape)}"
+                )
+            context, context_mask = self._append_proprio_to_context(
+                context=context, context_mask=context_mask, proprio=proprio,
+            )
+
+        # --- frame-0 latent + single-frame pre_dit (t=0) ---
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        f, h, w = video_pre["meta"]["grid_size"]
+        tpf = int(video_pre["meta"]["tokens_per_frame"])
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        vmask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=tpf,
+            device=video_pre["tokens"].device,
+        )
+        hidden = self.mot.extract_video_hidden(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=vmask,
+            tap_layer=tap_layer,
+        )
+        # Frame-0 occupies the first `tpf` tokens (== whole sequence when f == 1).
+        frame0 = hidden[:, :tpf].reshape(hidden.shape[0], int(h), int(w), hidden.shape[-1])
+        return {
+            "hidden": frame0,
+            "grid_size": (int(f), int(h), int(w)),
+            "tokens_per_frame": tpf,
+        }
+
+    @torch.no_grad()
+    def extract_future_latents(self, video_tensor: torch.Tensor, tiled: bool = False) -> torch.Tensor:
+        """VAE-encode a full pixel clip and return the non-first ("future") latents.
+
+        Channel-2 (future-latent flow head) target producer. The clip is encoded once;
+        latent frame 0 is the current obs, frames ``1:`` are the future.
+
+        Args:
+            video_tensor: Pixel clip [B, 3, T, H, W] in [-1, 1] with ``T % 4 == 1``.
+            tiled: Pass-through to the VAE encoder.
+
+        Returns:
+            Future latents [B, z_dim, T_lat - 1, h, w] (``T_lat = (T - 1) // 4 + 1``).
+        """
+        if video_tensor.ndim != 5 or video_tensor.shape[1] != 3:
+            raise ValueError(
+                f"`video_tensor` must be [B,3,T,H,W], got {tuple(video_tensor.shape)}"
+            )
+        z = self._encode_video_latents(video_tensor, tiled=tiled)
+        if z.shape[2] < 2:
+            raise ValueError(
+                f"Encoded clip has only {z.shape[2]} latent frame(s); need >= 2 for future latents."
+            )
+        return z[:, :, 1:]
+
     def build_inputs(self, sample, tiled: bool = False):
         video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:

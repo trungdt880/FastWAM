@@ -340,6 +340,93 @@ class MoT(nn.Module):
             kv_cache.append({"k": k, "v": v})
         return kv_cache
 
+    @torch.no_grad()
+    def extract_video_hidden(
+        self,
+        video_tokens: torch.Tensor,
+        video_freqs: torch.Tensor,
+        video_t_mod: torch.Tensor,
+        video_context_payload: Optional[dict],
+        video_attention_mask: torch.Tensor,
+        tap_layer: int,
+    ) -> torch.Tensor:
+        """Run the video expert through layers ``0..tap_layer`` and return hidden states.
+
+        This is the read-only twin of :meth:`prefill_video_cache`: it reuses the exact
+        same per-layer computation (``_build_expert_attention_io`` ->
+        ``_mixed_attention`` -> ``_apply_post_with_optional_checkpoint``) but stops after
+        ``tap_layer`` and returns the *hidden states* (the per-layer block output that
+        feeds the next layer), rather than caching K/V. Used to extract teacher
+        world-features for distillation (REPA target).
+
+        Args:
+            video_tokens: Video tokens before layer 0, shape [B, Sv, D].
+            video_freqs: Video RoPE frequencies, shape [Sv, 1, rope_dim].
+            video_t_mod: Video time modulation tensor.
+            video_context_payload: Optional dict for video cross-attention
+                (keys ``context`` [B, L, D] and ``mask`` [B, Sv, L] or [B, 1, Sv, L]).
+            video_attention_mask: Video self-attention mask, shape [Sv, Sv].
+            tap_layer: Inclusive index of the last block to run (0-based).
+
+        Returns:
+            Hidden states at ``tap_layer``, shape [B, Sv, D].
+        """
+        if "video" not in self.mixtures:
+            raise ValueError("MoT requires `video` expert for `extract_video_hidden`.")
+        if not (0 <= tap_layer < self.num_layers):
+            raise ValueError(
+                f"`tap_layer` must be in [0, {self.num_layers - 1}], got {tap_layer}."
+            )
+        if video_attention_mask.ndim != 2:
+            raise ValueError(
+                f"`video_attention_mask` must be 2D [S,S], got shape {tuple(video_attention_mask.shape)}"
+            )
+        if video_attention_mask.shape[0] != video_tokens.shape[1]:
+            raise ValueError(
+                "`video_attention_mask` seq length mismatch: "
+                f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
+            )
+
+        expert = self.mixtures["video"]
+        x = video_tokens
+        for layer_idx in range(tap_layer + 1):
+            block = expert.blocks[layer_idx]
+            (
+                q,
+                k,
+                v,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=video_freqs,
+                t_mod=video_t_mod,
+            )
+            mixed = self._mixed_attention(
+                q_cat=q,
+                k_cat=k,
+                v_cat=v,
+                attention_mask=video_attention_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=False,
+                mixed_slice=mixed,
+                context_payload=video_context_payload,
+            )
+        return x
+
     def forward_action_with_video_cache(
         self,
         action_tokens: torch.Tensor,
